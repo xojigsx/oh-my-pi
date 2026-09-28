@@ -822,6 +822,8 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		foreground: boolean;
 		/** Approval tier bounding the job's URL filesystem. */
 		approvalTier: ToolTier;
+		/** Call-identity env (`OMP_TOOL_CALL_ID`/`OMP_SESSION_ID`) exported to the job's children. */
+		identityEnv: Record<string, string>;
 	}): ManagedBashJobHandle {
 		const manager = this.session.asyncJobManager;
 		if (!manager) {
@@ -846,6 +848,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 						cwd: options.commandCwd,
 						sessionKey: `${this.session.getSessionId?.() ?? ""}:async:${jobId}`,
 						timeout: options.timeoutMs ?? 0,
+						env: options.identityEnv,
 						signal: runSignal,
 						// Bound to the job's own signal: the job outlives the call that started it.
 						filesystem: this.#urlFilesystem(runSignal, options.approvalTier).shellFilesystem(),
@@ -926,7 +929,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 	}
 
 	async execute(
-		_toolCallId: string,
+		toolCallId: string,
 		{
 			command: rawCommand,
 			timeout: rawTimeout,
@@ -940,6 +943,16 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		onUpdate?: AgentToolUpdateCallback<BashToolDetails>,
 		ctx?: AgentToolContext,
 	): Promise<AgentToolResult<BashToolDetails>> {
+		// Consumer contract for wrappers that record process lifetimes: every
+		// process spawned for this call observes OMP_TOOL_CALL_ID (this call's
+		// tool-call id) and OMP_SESSION_ID (the owning session, when it exposes
+		// one), so an OS process row can be joined back to the exact tool call
+		// that launched it. Merge order follows the tool's caller-overlay-wins
+		// env convention (see `applyDirenvPreflight`): a value the caller
+		// explicitly provides under the same name is never overwritten.
+		const callIdentityEnv: Record<string, string> = { OMP_TOOL_CALL_ID: toolCallId };
+		const sessionId = this.session.getSessionId?.();
+		if (sessionId) callIdentityEnv.OMP_SESSION_ID = sessionId;
 		let command = rawCommand;
 
 		// Extract a leading `cd <path> && ...` into cwd when the model ignores the
@@ -1053,6 +1066,10 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 					command,
 					cwd: commandCwd,
 					pty: pty ?? true,
+					// Call identity rides the service spec's env overlay (shell env
+					// first, identity wins) so service children stay joinable to
+					// this exact tool call.
+					env: callIdentityEnv,
 					ready,
 				},
 				signal,
@@ -1107,6 +1124,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				onUpdate,
 				foreground: false,
 				approvalTier,
+				identityEnv: callIdentityEnv,
 			});
 			return this.#buildBackgroundStartResult(job.jobId, "", timeoutSec, {
 				requestedTimeoutSec,
@@ -1147,6 +1165,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				onUpdate,
 				foreground: !startBackgrounded,
 				approvalTier,
+				identityEnv: callIdentityEnv,
 			});
 			if (startBackgrounded) {
 				return this.#buildBackgroundStartResult(job.jobId, "", timeoutSec, {
@@ -1204,6 +1223,10 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			bridgeTerminalAvailable || canUseInteractiveBashPty(pty === true, ctx)
 				? await applyDirenvPreflight(command, commandCwd, {
 						signal,
+						// Caller overlay: the call-identity vars ride here so the ACP
+						// terminal and PTY children see them, and the caller-wins rule
+						// keeps them authoritative over any `.envrc` value.
+						callerEnv: callIdentityEnv,
 						timeoutMs: cfgBashDirenvLoadTimeoutMs.get(this.session.settings),
 						callerTimeoutMs: timeoutMs,
 						direnvSetting: cfgBashDirenv.get(this.session.settings),
@@ -1499,11 +1522,13 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 					artifactId,
 				})
 			: // executeBash runs its OWN direnv preflight internally — pass the RAW
-				// command here so the unset prefix is not applied twice.
+				// command here so the unset prefix is not applied twice. The call
+				// identity rides `env` as that preflight's caller overlay.
 				await executeBash(command, {
 					cwd: commandCwd,
 					sessionKey: this.session.getSessionId?.() ?? undefined,
 					timeout: timeoutMs ?? 0,
+					env: callIdentityEnv,
 					signal,
 					filesystem: this.#urlFilesystem(signal, approvalTier).shellFilesystem(),
 					artifactPath,

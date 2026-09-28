@@ -1,12 +1,21 @@
-import { describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { Judge, JudgmentRequest, JudgmentResult, NoulAnswer, Questions } from "@oh-my-pi/pi-ai";
+import type {
+	ImageContent,
+	Judge,
+	JudgmentRequest,
+	JudgmentResult,
+	NoulAnswer,
+	Questions,
+	TextContent,
+} from "@oh-my-pi/pi-ai";
 import { tokenUsage } from "@oh-my-pi/pi-ai";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { InternalUrlRouter } from "@oh-my-pi/pi-coding-agent/internal-urls/router";
 import { InternalUrlFilesystem } from "@oh-my-pi/pi-coding-agent/internal-urls/url-filesystem";
+import * as judgment from "@oh-my-pi/pi-coding-agent/judgment";
 import { FindTool } from "@oh-my-pi/pi-coding-agent/tools/jfind";
 import { runCascade } from "@oh-my-pi/pi-coding-agent/tools/jfind/cascade";
 import { keywordsFromQuery } from "@oh-my-pi/pi-coding-agent/tools/jfind/keywords";
@@ -397,6 +406,166 @@ describe("jfind cascade", () => {
 					signal: controller.signal,
 				}),
 			).rejects.toThrow("Operation aborted");
+		} finally {
+			await removeWithRetries(dir);
+		}
+	});
+});
+
+/** A `find` tool over `cwd` whose judge-role resolution yields `judge` instead of the live chain. */
+function findToolWithJudge(cwd: string, judge: Judge): FindTool {
+	vi.spyOn(judgment, "resolveJudge").mockReturnValue(judge as never);
+	return new FindTool({
+		cwd,
+		hasUI: false,
+		getSessionFile: () => null,
+		getSessionSpawns: () => "*",
+		settings: Settings.isolated({ "find.enabled": "on" }),
+		// The spy short-circuits ChainJudge, so resolution never reads the catalog.
+		modelRegistry: {} as never,
+	});
+}
+
+/** The model-facing report of a tool result; throws when it carries no text block. */
+function reportText(result: { content: readonly (TextContent | ImageContent)[] }): string {
+	const block = result.content[0];
+	if (block?.type !== "text") throw new Error("find result carried no text block");
+	return block.text;
+}
+
+describe("jfind find report failure semantics", () => {
+	afterEach(() => {
+		vi.restoreAllMocks();
+	});
+
+	it("opens with find unavailable plus a fallback when the judge failed every request", async () => {
+		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "jfind-report-failed-"));
+		try {
+			await Bun.write(path.join(dir, "a.ts"), "export function parseToken() { return 1; }\n");
+			const tool = findToolWithJudge(dir, new FakeJudge(() => new Error("judge backend down")));
+			const result = await tool.execute("call", { query: "token parsing", grep_keywords: [] });
+			const stats = result.details!.stats;
+			expect(stats.requests).toBeGreaterThan(0);
+			expect(stats.errors).toBe(stats.requests);
+			const text = reportText(result);
+			const lines = text.split("\n");
+			expect(lines[0]).toBe(
+				`find unavailable for "token parsing": the judge failed for every request (${stats.errors} of ${stats.requests})`,
+			);
+			expect(lines[1]).toBe(
+				"fallback: use grep/glob/read for deterministic results; do not rephrase this query to the same judge.",
+			);
+			expect(text).not.toContain("no hits for");
+			// The stats line and failure list still follow the lead.
+			expect(text).toContain(`${stats.requests} requests`);
+			expect(text).toContain("filenames: judge backend down");
+			expect(result.isError).toBe(true);
+		} finally {
+			await removeWithRetries(dir);
+		}
+	});
+
+	it("prefixes partial failures and still lists the hits the successful requests produced", async () => {
+		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "jfind-report-partial-"));
+		try {
+			await Bun.write(path.join(dir, "a.ts"), "export function parseToken() { return 1; }\n");
+			const judge = new FakeJudge(request => {
+				const state = stateOf(request);
+				if ("files" in state) return new Error("sketch backend down");
+				if ("tree" in state) return String(state.tree).includes("a.ts") ? 0.9 : 0.1;
+				return 0.95;
+			});
+			const tool = findToolWithJudge(dir, judge);
+			const result = await tool.execute("call", { query: "token parsing", grep_keywords: [] });
+			const stats = result.details!.stats;
+			expect(stats.errors).toBeGreaterThan(0);
+			expect(stats.errors).toBeLessThan(stats.requests);
+			const text = reportText(result);
+			const lines = text.split("\n");
+			expect(lines[0]).toBe(
+				`partial: ${stats.errors} of ${stats.requests} judge requests failed; results below come only from the requests that succeeded`,
+			);
+			expect(lines[1]).toContain('hit(s) for "token parsing"');
+			expect(text).toContain("a.ts");
+			expect(result.isError).toBeFalsy();
+		} finally {
+			await removeWithRetries(dir);
+		}
+	});
+
+	it("prefixes a partial negative before the no-hits line instead of claiming a clean miss", async () => {
+		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "jfind-report-partialneg-"));
+		try {
+			await Bun.write(path.join(dir, "a.ts"), "export function parseToken() { return 1; }\n");
+			const judge = new FakeJudge(request => {
+				const state = stateOf(request);
+				if ("file" in state) return new Error("verifier down");
+				return 0.9;
+			});
+			const tool = findToolWithJudge(dir, judge);
+			const result = await tool.execute("call", { query: "token parsing", grep_keywords: [] });
+			const details = result.details!;
+			expect(details.stats.errors).toBeGreaterThan(0);
+			expect(details.stats.errors).toBeLessThan(details.stats.requests);
+			expect(details.hits).toHaveLength(0);
+			const text = reportText(result);
+			const lines = text.split("\n");
+			expect(lines[0]).toBe(
+				`partial: ${details.stats.errors} of ${details.stats.requests} judge requests failed; results below come only from the requests that succeeded`,
+			);
+			expect(lines[1]).toBe(`no hits for "token parsing" (τ ${details.threshold.toFixed(2)})`);
+			expect(result.isError).toBeFalsy();
+		} finally {
+			await removeWithRetries(dir);
+		}
+	});
+
+	it("keeps the exact no-hits lead when every request succeeded", async () => {
+		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "jfind-report-nohit-"));
+		try {
+			await Bun.write(path.join(dir, "a.ts"), "export function parseToken() { return 1; }\n");
+			const tool = findToolWithJudge(dir, new FakeJudge(() => 0.1));
+			const result = await tool.execute("call", { query: "token parsing", grep_keywords: [] });
+			const details = result.details!;
+			expect(details.stats.requests).toBeGreaterThan(0);
+			expect(details.stats.errors).toBe(0);
+			expect(details.hits).toHaveLength(0);
+			const text = reportText(result);
+			const lines = text.split("\n");
+			expect(lines[0]).toBe(`no hits for "token parsing" (τ ${details.threshold.toFixed(2)})`);
+			expect(text).not.toContain("partial:");
+			expect(text).not.toContain("find unavailable");
+			expect(result.isError).toBeFalsy();
+		} finally {
+			await removeWithRetries(dir);
+		}
+	});
+
+	it("lists hits unchanged when every request succeeded", async () => {
+		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "jfind-report-hits-"));
+		try {
+			await Bun.write(path.join(dir, "a.ts"), "export function parseToken() { return 1; }\n");
+			const judge = new FakeJudge(request => {
+				const state = stateOf(request);
+				if ("tree" in state) return String(state.tree).includes("a.ts") ? 0.9 : 0.1;
+				if ("files" in state) return 0.9;
+				return 0.95;
+			});
+			const tool = findToolWithJudge(dir, judge);
+			const result = await tool.execute("call", { query: "token parsing", grep_keywords: [] });
+			const details = result.details!;
+			expect(details.stats.requests).toBeGreaterThan(0);
+			expect(details.stats.errors).toBe(0);
+			expect(details.hits.map(hit => hit.rel)).toEqual(["a.ts"]);
+			const text = reportText(result);
+			const lines = text.split("\n");
+			expect(lines[0]).toBe(
+				`1 hit(s) for "token parsing" (τ ${details.threshold.toFixed(2)}), strongest first`,
+			);
+			expect(text).toContain("a.ts");
+			expect(text).not.toContain("partial:");
+			expect(text).not.toContain("find unavailable");
+			expect(result.isError).toBeFalsy();
 		} finally {
 			await removeWithRetries(dir);
 		}

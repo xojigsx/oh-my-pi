@@ -126,16 +126,36 @@ export class FindTool implements AgentTool<typeof findSchema, FindToolDetails> {
 		const details: FindToolDetails = { query, keywords, threshold, hits, stats, elapsedMs, cwd, scopePath };
 		const where = scopePath === undefined ? "" : ` in ${scopePath}`;
 		const out: string[] = [];
-		if (hits.length === 0) {
-			out.push(`no hits for "${query}"${where} (τ ${threshold.toFixed(2)})`);
+		// Three report leads: a total judge failure must not masquerade as a
+		// verified negative (it sends the model to grep/glob/read instead),
+		// partial results are labelled so they are not read as exhaustive, and
+		// a healthy zero-hit run keeps the exact `no hits` negative control.
+		const failedEveryRequest = stats.requests > 0 && stats.errors === stats.requests;
+		const failedSomeRequests = stats.errors > 0 && stats.errors < stats.requests;
+		if (failedEveryRequest) {
+			out.push(
+				`find unavailable for "${query}"${where}: the judge failed for every request (${stats.errors} of ${stats.requests})`,
+				`fallback: use grep/glob/read for deterministic results; do not rephrase this query to the same judge.`,
+			);
 		} else {
-			out.push(`${hits.length} hit(s) for "${query}"${where} (τ ${threshold.toFixed(2)}), strongest first`, "");
-			for (const hit of hits) {
-				const coverage = hit.truncated ? `${hit.linesSeen} lines judged, partial` : `${hit.linesSeen} lines judged`;
-				out.push(`${hit.rel}  ${hit.contentScore.toFixed(2)}  ${coverage}`);
-				for (const range of rankedHeat(hit.ranges, RANGES_SHOWN)) {
-					const span = range.start === range.end ? String(range.start) : `${range.start}-${range.end}`;
-					out.push(`  ${hit.rel}:${span}  ${range.p.toFixed(2)}  ${range.snippet}`);
+			if (failedSomeRequests) {
+				out.push(
+					`partial: ${stats.errors} of ${stats.requests} judge requests failed; results below come only from the requests that succeeded`,
+				);
+			}
+			if (hits.length === 0) {
+				out.push(`no hits for "${query}"${where} (τ ${threshold.toFixed(2)})`);
+			} else {
+				out.push(`${hits.length} hit(s) for "${query}"${where} (τ ${threshold.toFixed(2)}), strongest first`, "");
+				for (const hit of hits) {
+					const coverage = hit.truncated
+						? `${hit.linesSeen} lines judged, partial`
+						: `${hit.linesSeen} lines judged`;
+					out.push(`${hit.rel}  ${hit.contentScore.toFixed(2)}  ${coverage}`);
+					for (const range of rankedHeat(hit.ranges, RANGES_SHOWN)) {
+						const span = range.start === range.end ? String(range.start) : `${range.start}-${range.end}`;
+						out.push(`  ${hit.rel}:${span}  ${range.p.toFixed(2)}  ${range.snippet}`);
+					}
 				}
 			}
 		}
@@ -150,7 +170,7 @@ export class FindTool implements AgentTool<typeof findSchema, FindToolDetails> {
 			);
 		}
 		const builder = toolResult(details).text(out.join("\n"));
-		if (stats.requests > 0 && stats.errors === stats.requests) builder.error();
+		if (failedEveryRequest) builder.error();
 		else if (hits.length === 0) builder.useless();
 		return builder.done();
 	}

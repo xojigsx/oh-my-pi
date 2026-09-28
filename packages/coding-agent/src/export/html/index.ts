@@ -3,9 +3,11 @@ import * as path from "node:path";
 import type { AgentState } from "@oh-my-pi/pi-agent-core";
 import { APP_NAME, isEnoent } from "@oh-my-pi/pi-utils";
 import { getResolvedThemeColors, getThemeExportColors } from "@oh-my-pi/pi-tui/theme";
+import type { SecretObfuscator } from "../../secrets/obfuscator";
 import type { SessionEntry, SessionHeader } from "../../session/session-entries";
 import { loadEntriesFromFile } from "../../session/session-loader";
 import { SessionManager } from "../../session/session-manager";
+import { redactSessionDataForExport } from "../redact-session-data";
 import type { ExportThemeNames } from "./args";
 import templateCssPath from "./template.css" with { type: "file" };
 import templateHtmlPath from "./template.html" with { type: "file" };
@@ -61,6 +63,14 @@ export interface ExportOptions {
 	themeNames?: ExportThemeNames;
 	/** Embed subagent session transcripts found next to the session file (default true). */
 	includeSubSessions?: boolean;
+	/**
+	 * Redacts the snapshot before it is embedded, through the same typed
+	 * per-field walk `/share` uses ({@link redactSessionDataForExport}), so
+	 * designated sensitive fields never land in the exported file while error
+	 * category, call identity and timing stay intact. Pass undefined to keep
+	 * the export raw — the local `/export` default.
+	 */
+	obfuscator?: SecretObfuscator;
 }
 
 /** Parse a color string to RGB values. */
@@ -281,7 +291,8 @@ export async function exportSessionToHtml(
 	const sessionFile = sm.getSessionFile();
 	if (!sessionFile) throw new Error("Cannot export in-memory session to HTML");
 
-	const sessionData = buildSessionData(sm, state);
+	const snapshot = buildSessionData(sm, state);
+	const sessionData = opts.obfuscator?.hasSecrets() ? redactSessionDataForExport(opts.obfuscator, snapshot) : snapshot;
 	if (opts.includeSubSessions !== false) {
 		const subSessions = await collectSubSessions(sessionFile);
 		if (Object.keys(subSessions).length > 0) sessionData.subSessions = subSessions;
@@ -310,11 +321,14 @@ export async function exportFromFile(inputPath: string, options?: ExportOptions 
 		throw err;
 	}
 
-	const sessionData: SessionData = {
+	const rawSessionData: SessionData = {
 		header: sessionHeaderForExport(sm.getHeader()),
 		entries: sm.getEntries(),
 		leafId: sm.getLeafId(),
 	};
+	const sessionData: SessionData = opts.obfuscator?.hasSecrets()
+		? redactSessionDataForExport(opts.obfuscator, rawSessionData)
+		: rawSessionData;
 	if (opts.includeSubSessions !== false) {
 		const subSessions = await collectSubSessions(inputPath);
 		if (Object.keys(subSessions).length > 0) sessionData.subSessions = subSessions;

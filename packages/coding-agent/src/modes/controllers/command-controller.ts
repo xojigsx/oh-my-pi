@@ -297,7 +297,14 @@ export class CommandController {
 		if (customShare) {
 			const tmpFile = path.join(os.tmpdir(), `${Snowflake.next()}.html`);
 			try {
-				await this.ctx.session.exportToHtml(tmpFile);
+				// Same leak boundary and gate as the default flow below: the handler
+				// uploads this HTML, so honor `share.redactSecrets` with the session's
+				// own obfuscator.
+				await this.ctx.session.exportToHtml(
+					tmpFile,
+					false,
+					cfgShareRedactSecrets.get(this.ctx.settings) ? this.ctx.session.obfuscator : undefined,
+				);
 				const result = await customShare.fn(tmpFile);
 				if (loader.signal.aborted) return;
 				restoreEditor();

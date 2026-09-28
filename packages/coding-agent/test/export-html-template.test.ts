@@ -35,6 +35,7 @@ const bundledDependencyStubs: Record<string, string> = {
 	"../../session/session-loader": "export const loadEntriesFromFile = async () => [];",
 	"../../session/session-manager":
 		"export class SessionManager { static async open() { return new SessionManager(); } }",
+	"../redact-session-data": "export const redactSessionDataForExport = (_obfuscator, data) => data;",
 	"./args": "export const parseExportArgs = () => undefined;",
 	"./web-palette": 'export const webExportThemeVars = () => "";',
 };

@@ -2557,7 +2557,7 @@ export class AgentSession implements SettingsScope {
 		return this.#ttsr.manager;
 	}
 
-	/** Secret obfuscator, when secrets are configured; /share redaction reuses it. */
+	/** Secret obfuscator, when secrets are configured; /share redaction and the HTML export handed to a custom share handler reuse it. */
 	get obfuscator(): SecretObfuscator | undefined {
 		return this.#obfuscator;
 	}
@@ -12129,8 +12129,16 @@ export class AgentSession implements SettingsScope {
 	 * Export session to HTML.
 	 * @param outputPath Optional output path
 	 * @param useUserThemes Bundle the dark and light TUI themes selected in settings
+	 * @param obfuscator Redact the snapshot through this obfuscator before embedding.
+	 *   Callers at a leak boundary (an upload — the custom `/share` handler) pass the
+	 *   session obfuscator gated by `share.redactSecrets`; local exports leave it
+	 *   undefined and stay raw.
 	 */
-	async exportToHtml(outputPath?: string, useUserThemes = false): Promise<string> {
+	async exportToHtml(
+		outputPath?: string,
+		useUserThemes = false,
+		obfuscator?: SecretObfuscator,
+	): Promise<string> {
 		// Lazy import: the export module embeds the HTML template and pre-built
 		// tool renderers as text; only `/export` should pay that load.
 		const { exportSessionToHtml } = await import("../export/html");
@@ -12143,6 +12151,7 @@ export class AgentSession implements SettingsScope {
 						light: cfgThemeLight.get(this.settings),
 					}
 				: undefined,
+			obfuscator,
 		});
 	}
 

@@ -4,10 +4,25 @@
  * it, so a real child of the bash tool must observe the executing call's id —
  * and never a previous call's stale value.
  */
-import { describe, expect, it } from "bun:test";
+import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { BashTool } from "@oh-my-pi/pi-coding-agent/tools/bash";
+
+// The suite asserts exact absence/presence of the identity vars in spawned
+// children; an outer omp session exporting them (nested invocations) would
+// leak into the inherited environment and defeat the assertions.
+const AMBIENT_IDENTITY_VARS = ["OMP_TOOL_CALL_ID", "OMP_SESSION_ID"] as const;
+const savedAmbientIdentity = AMBIENT_IDENTITY_VARS.map(name => [name, process.env[name]] as const);
+beforeAll(() => {
+	for (const name of AMBIENT_IDENTITY_VARS) delete process.env[name];
+});
+afterAll(() => {
+	for (const [name, value] of savedAmbientIdentity) {
+		if (value === undefined) delete process.env[name];
+		else process.env[name] = value;
+	}
+});
 
 function makeSession(sessionId?: string): ToolSession {
 	return {

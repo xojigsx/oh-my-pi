@@ -41,6 +41,9 @@ export interface BashExecutorOptions {
 	sessionKey?: string;
 	/** Additional environment variables to inject */
 	env?: Record<string, string>;
+	/** Variables required absent from the child's environment; rides the
+	 *  preflight's `unset -v` prefix since overlays are additive. */
+	unsetEnv?: readonly string[];
 	/** Run through the configured user shell instead of brush parsing directly. */
 	useUserShell?: boolean;
 	/** Run supported user shells (zsh/fish) on a headless PTY; requires `useUserShell`. */
@@ -103,6 +106,11 @@ const URL_CWD_RE = /^[a-z][a-z0-9+.-]*:\/\//i;
 export interface DirenvPreflightOptions {
 	/** Caller-supplied env overlay; these values win over direnv-provided ones. */
 	callerEnv?: Record<string, string>;
+	/** Variables the caller requires absent from the child's environment (e.g.
+	 *  a stale `OMP_SESSION_ID` a shared shell server inherited at startup).
+	 *  Env overlays are additive, so removal rides the command: prepended as a
+	 *  regex-gated `unset -v`, skipped for any name `callerEnv` re-supplies. */
+	unsetEnv?: readonly string[];
 	signal?: AbortSignal;
 	/** Full direnv-load budget (`bash.direnvLoadTimeoutMs`). A positive
 	 *  `callerTimeoutMs` clamps the effective load below this; `0`/undefined
@@ -128,7 +136,8 @@ export interface DirenvPreflightOptions {
  * every bash backend (one-shot `executeBash`, ACP client terminal, PTY) exposes
  * the same devenv tools. Encapsulates: load the diff, merge `set` under the
  * caller's overlay (caller wins), and prepend a regex-gated `unset -v` for
- * variables the `.envrc` removes (skipping any the caller re-supplied).
+ * variables the `.envrc` removes plus any the caller requires absent via
+ * `unsetEnv` (skipping any the caller re-supplied).
  *
  * Returns the possibly-prefixed command plus the merged env, or the inputs
  * unchanged (`env` = `callerEnv`) when direnv is off, absent, or has no `.envrc`.
@@ -151,8 +160,14 @@ export async function applyDirenvPreflight(
 			: opts.timeoutMs;
 	const direnvDiff =
 		opts.direnvSetting === "off" ? null : await loadDirenvEnv(cwd, { timeoutMs: loadTimeoutMs, signal: opts.signal });
+	// Caller-required removals apply on every path, direnv or not: they keep
+	// identity/stale vars out of children even when no `.envrc` is involved.
+	const requiredUnsets = (opts.unsetEnv ?? []).filter(
+		name => !(opts.callerEnv && name in opts.callerEnv) && SAFE_ENV_NAME.test(name),
+	);
 	if (!direnvDiff) {
-		return { command: withPrefix(command), env: opts.callerEnv };
+		const unsetPrefix = requiredUnsets.length > 0 ? `unset -v ${requiredUnsets.join(" ")}; ` : "";
+		return { command: `${unsetPrefix}${withPrefix(command)}`, env: opts.callerEnv };
 	}
 	// The caller's explicit env still wins over direnv-provided values.
 	const mergedEnv = { ...direnvDiff.set, ...opts.callerEnv };
@@ -163,7 +178,10 @@ export async function applyDirenvPreflight(
 	const direnvUnsets = direnvDiff.unset.filter(
 		name => !(opts.callerEnv && name in opts.callerEnv) && SAFE_ENV_NAME.test(name),
 	);
-	const unsetPrefix = direnvUnsets.length > 0 ? `unset -v ${direnvUnsets.join(" ")}; ` : "";
+	const unsetByName: Record<string, true> = {};
+	for (const name of [...requiredUnsets, ...direnvUnsets]) unsetByName[name] = true;
+	const unsets = Object.keys(unsetByName);
+	const unsetPrefix = unsets.length > 0 ? `unset -v ${unsets.join(" ")}; ` : "";
 	return { command: `${unsetPrefix}${withPrefix(command)}`, env: mergedEnv };
 }
 
@@ -518,6 +536,7 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 	// has no `.envrc` on the host.
 	const preflight = await applyDirenvPreflight(command, commandCwd ?? process.cwd(), {
 		callerEnv: options?.env,
+		unsetEnv: options?.unsetEnv,
 		signal: options?.signal,
 		timeoutMs: cfgBashDirenvLoadTimeoutMs.get(settings),
 		callerTimeoutMs: options?.timeout,

@@ -12,6 +12,9 @@ function makeSession(bridge: ClientBridge): ToolSession {
 		hasUI: false,
 		skills: [],
 		getSessionFile: () => null,
+		// Session id keeps the call-identity env complete, so the wrapped shell
+		// line this test pins stays free of the `unset -v` identity prefix.
+		getSessionId: () => "acp-terminal-session",
 		// Fixed bash shell keeps the wrap assertions cross-platform: the fix
 		// must reuse the resolved shell (Git Bash on Windows, `$SHELL` on
 		// POSIX) instead of collapsing to `cmd.exe` — that's the contract

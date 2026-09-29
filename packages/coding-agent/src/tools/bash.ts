@@ -824,6 +824,8 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		approvalTier: ToolTier;
 		/** Call-identity env (`OMP_TOOL_CALL_ID`/`OMP_SESSION_ID`) exported to the job's children. */
 		identityEnv: Record<string, string>;
+		/** Identity vars required absent (`OMP_SESSION_ID` when the session exposes no id). */
+		identityUnsets: readonly string[];
 	}): ManagedBashJobHandle {
 		const manager = this.session.asyncJobManager;
 		if (!manager) {
@@ -849,6 +851,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 						sessionKey: `${this.session.getSessionId?.() ?? ""}:async:${jobId}`,
 						timeout: options.timeoutMs ?? 0,
 						env: options.identityEnv,
+						unsetEnv: options.identityUnsets,
 						signal: runSignal,
 						// Bound to the job's own signal: the job outlives the call that started it.
 						filesystem: this.#urlFilesystem(runSignal, options.approvalTier).shellFilesystem(),
@@ -953,6 +956,10 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		const callIdentityEnv: Record<string, string> = { OMP_TOOL_CALL_ID: toolCallId };
 		const sessionId = this.session.getSessionId?.();
 		if (sessionId) callIdentityEnv.OMP_SESSION_ID = sessionId;
+		// Absence is part of the contract: with no session id, a shared shell
+		// server's inherited or stale OMP_SESSION_ID must not leak into children.
+		// Env overlays are additive, so removal rides the `unset -v` prefix.
+		const identityUnsets: readonly string[] = sessionId ? [] : ["OMP_SESSION_ID"];
 		let command = rawCommand;
 
 		// Extract a leading `cd <path> && ...` into cwd when the model ignores the
@@ -1059,11 +1066,15 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		}
 
 		if (name !== undefined) {
+			// Service children reach this shell through the broker daemon, whose
+			// baseline env may carry stale identity values; same removal route.
+			const serviceCommand =
+				identityUnsets.length > 0 ? `unset -v ${identityUnsets.join(" ")}; ${command}` : command;
 			const service = await startService(
 				this.session,
 				{
 					name,
-					command,
+					command: serviceCommand,
 					cwd: commandCwd,
 					pty: pty ?? true,
 					// Call identity rides the service spec's env overlay (shell env
@@ -1125,6 +1136,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				foreground: false,
 				approvalTier,
 				identityEnv: callIdentityEnv,
+				identityUnsets,
 			});
 			return this.#buildBackgroundStartResult(job.jobId, "", timeoutSec, {
 				requestedTimeoutSec,
@@ -1166,6 +1178,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				foreground: !startBackgrounded,
 				approvalTier,
 				identityEnv: callIdentityEnv,
+				identityUnsets,
 			});
 			if (startBackgrounded) {
 				return this.#buildBackgroundStartResult(job.jobId, "", timeoutSec, {
@@ -1227,6 +1240,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 						// terminal and PTY children see them, and the caller-wins rule
 						// keeps them authoritative over any `.envrc` value.
 						callerEnv: callIdentityEnv,
+						unsetEnv: identityUnsets,
 						timeoutMs: cfgBashDirenvLoadTimeoutMs.get(this.session.settings),
 						callerTimeoutMs: timeoutMs,
 						direnvSetting: cfgBashDirenv.get(this.session.settings),
@@ -1529,6 +1543,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 					sessionKey: this.session.getSessionId?.() ?? undefined,
 					timeout: timeoutMs ?? 0,
 					env: callIdentityEnv,
+					unsetEnv: identityUnsets,
 					signal,
 					filesystem: this.#urlFilesystem(signal, approvalTier).shellFilesystem(),
 					artifactPath,

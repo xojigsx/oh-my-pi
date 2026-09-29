@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -12,6 +12,7 @@ import {
 import { clearClaudePluginRootsCache, injectPluginDirRoots } from "@oh-my-pi/pi-coding-agent/discovery/helpers";
 import { discoverAgents } from "@oh-my-pi/pi-coding-agent/task/discovery";
 import { removeWithRetries } from "@oh-my-pi/pi-utils";
+import * as logger from "@oh-my-pi/pi-utils/logger";
 
 const OMP_AGENT_MD = [
 	"---",
@@ -39,6 +40,25 @@ const CLAUDE_AGENT_MD = [
 	"---",
 	"You are a Claude Code custom subagent.",
 ].join("\n");
+
+// Modeled on anthropics/claude-code pr-review-toolkit `agents/code-simplifier.md`:
+// a description plain scalar with literal `\n` escapes plus raw continuation
+// lines (a `key: value` lookalike and a bare prose line) that make the strict
+// record fail (F4).
+const MULTILINE_DESCRIPTION_AGENT_MD = [
+	"---",
+	"name: code-simplifier",
+	"description: Use this agent when code has been written or modified.\\n\\nExamples:\\n\\n<example>",
+	'user: "Please add authentication to the /api/users endpoint"',
+	"<function call omitted for brevity>",
+	"model: opus",
+	"---",
+	"You are an expert code simplification specialist.",
+].join("\n");
+const MULTILINE_DESCRIPTION =
+	"Use this agent when code has been written or modified.\n\nExamples:\n\n<example>\n" +
+	'user: "Please add authentication to the /api/users endpoint"\n' +
+	"<function call omitted for brevity>";
 
 async function writeOmpPluginAgent(home: string): Promise<void> {
 	const userPluginsRoot = path.join(home, ".omp", "plugins");
@@ -75,13 +95,15 @@ async function writeOmpMarketplacePlugin(
 		agentName: string;
 		model: string;
 		manifest: "omp" | "claude" | "both" | "none";
+		/** Full agent markdown (frontmatter + body); defaults to a minimal one. */
+		content?: string;
 	},
 ): Promise<void> {
 	const pluginRoot = path.join(home, "marketplace-cache", options.agentName);
 	await fs.mkdir(path.join(pluginRoot, "agents"), { recursive: true });
 	await fs.writeFile(
 		path.join(pluginRoot, "agents", `${options.agentName}.md`),
-		agentMd(options.agentName, options.model),
+		options.content ?? agentMd(options.agentName, options.model),
 	);
 
 	const wantsOmp = options.manifest === "omp" || options.manifest === "both";
@@ -127,6 +149,7 @@ describe("discoverAgents", () => {
 	});
 
 	afterEach(async () => {
+		vi.restoreAllMocks();
 		enableProvider("omp-plugins");
 		clearOmpExtensionCliRoots();
 		await injectPluginDirRoots(tempHome, []);
@@ -304,5 +327,47 @@ describe("discoverAgents", () => {
 
 		expect(agent).toBeDefined();
 		expect(agent?.model).toEqual(["@advisor", "@smol"]);
+	});
+
+	test("loads a plugin agent whose description plain scalar needs block-scalar repair (F4)", async () => {
+		enableProvider("claude-plugins");
+		await writeOmpMarketplacePlugin(tempHome, {
+			agentName: "code-simplifier",
+			model: "opus",
+			manifest: "none",
+			content: MULTILINE_DESCRIPTION_AGENT_MD,
+		});
+		const warnSpy = vi.spyOn(logger, "warn").mockImplementation(() => {});
+
+		const { agents } = await discoverAgents(projectDir, tempHome);
+
+		const agent = agents.find(candidate => candidate.name === "code-simplifier");
+		expect(agent).toBeDefined();
+		// Description text preserved modulo newline representation — the strict
+		// fallback would have truncated it to its first physical line.
+		expect(agent?.description).toBe(MULTILINE_DESCRIPTION);
+		expect(agent?.systemPrompt).toBe("You are an expert code simplification specialist.");
+		expect(agent?.model).toEqual(["opus"]);
+		expect(warnSpy.mock.calls.filter(call => call[0] === "Failed to parse YAML frontmatter")).toEqual([]);
+	});
+
+	test("still skips a plugin agent whose frontmatter cannot round-trip (F4 control)", async () => {
+		enableProvider("claude-plugins");
+		await writeOmpMarketplacePlugin(tempHome, {
+			agentName: "broken-agent",
+			model: "opus",
+			manifest: "none",
+			content: ["---", "name: broken-agent", "invalid: [unclosed array", "---", "Body."].join("\n"),
+		});
+		const warnSpy = vi.spyOn(logger, "warn").mockImplementation(() => {});
+
+		const { agents } = await discoverAgents(projectDir, tempHome);
+
+		const warnings = warnSpy.mock.calls.map(call => String(call[0]));
+		// Unrepairable frontmatter still warns and the agent is still skipped:
+		// the fallback lacks a description, so agent-field parsing rejects it.
+		expect(agents.find(candidate => candidate.name === "broken-agent")).toBeUndefined();
+		expect(warnings).toContain("Failed to parse YAML frontmatter");
+		expect(warnings).toContain("Failed to read agent file");
 	});
 });

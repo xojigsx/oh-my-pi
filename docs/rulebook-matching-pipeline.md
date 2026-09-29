@@ -162,7 +162,13 @@ All providers use `parseFrontmatter` (`utils/frontmatter.ts`) with these semanti
 
 1. Frontmatter is parsed only when content starts with `---` and has a closing `\n---`.
 2. Body is trimmed after frontmatter extraction.
-3. If whole-document YAML parsing fails:
+3. If whole-document YAML parsing fails, lenient recovery runs first (only
+   when `repair` is enabled, the default): ambiguous plain scalars are quoted,
+   tabs widened, leading HTML comments stripped, and a failing multi-line
+   plain scalar (literal `\n` escapes plus raw continuation lines, as in
+   Claude Code plugin agent files) is rewritten as a block scalar whose text
+   round-trips modulo newline representation.
+4. If recovery still does not yield a parseable record:
    - a warning is logged,
    - the parser falls back to simple `key: value` line parsing (`^([\w-]+):\s*(.*)$`),
    - each captured value is reparsed independently as YAML, and only values that still fail parsing remain raw trimmed strings.

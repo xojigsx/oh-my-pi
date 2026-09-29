@@ -154,15 +154,19 @@ async function scanStandardSkills(
 				warnings.push(`Skipping skill "${entry.name}": failed to read SKILL.md`);
 				return;
 			}
-			// Strict parse: malformed YAML must be rejected, not repaired — no
-			// scalar quoting, tab replacement, comment stripping, or key aliasing.
+			// Repair-then-validate parse: lenient recovery (scalar quoting, tab
+			// widening, comment stripping, multi-line plain-scalar block rewrite)
+			// runs first — every step round-trips the text byte-for-byte modulo
+			// newline representation (F4) — and malformed YAML that cannot
+			// round-trip still throws here and skips the skill. Keys stay verbatim
+			// (rawKeys) for the spec's closed-schema validation.
 			let rawFrontmatter: Record<string, unknown>;
 			let body: string;
 			try {
 				({ frontmatter: rawFrontmatter, body } = parseFrontmatter(content, {
 					source: skillPath,
 					level: "fatal",
-					repair: false,
+					repair: true,
 					rawKeys: true,
 				}));
 			} catch {

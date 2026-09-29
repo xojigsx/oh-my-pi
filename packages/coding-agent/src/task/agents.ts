@@ -109,6 +109,10 @@ export function parseAgent(
 	const { frontmatter, body } = parseFrontmatter(content, {
 		location: filePath,
 		level,
+		// Plugin agents ship hand-authored multi-line plain-scalar descriptions
+		// (e.g. pr-review-toolkit `agents/code-simplifier.md`); the repair path
+		// rewrites them into block scalars instead of warning (F4).
+		repair: true,
 	});
 	const fields = parseAgentFields(frontmatter);
 	if (!fields) {

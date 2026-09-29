@@ -553,14 +553,17 @@ describe("agent-plugins discovery", () => {
 		}
 	});
 
-	test("rejects malformed or repaired YAML frontmatter per skill", async () => {
+	test("repairs round-trippable YAML frontmatter per skill and rejects the rest", async () => {
 		await writeManifest();
 		await writeSkill("good", "name: good\ndescription: Good skill");
-		// Strict YAML rejects an unquoted nested-colon scalar; the lenient repair
-		// path would quote it and accept the skill.
+		// Strict YAML rejects an unquoted nested-colon scalar; the repair quotes
+		// it byte-for-byte, so the skill loads instead of being skipped.
 		await writeSkill("repairable", "name: repairable\ndescription: Use when: extracting text");
+		// Unclosed flow sequence on the first line: no preceding plain scalar to
+		// rewrite and quoting cannot fix it — still rejected as malformed.
+		await writeSkill("broken", "invalid: [unclosed array");
 		// A leading HTML comment means the file does not start with frontmatter;
-		// only the lenient comment-stripping repair would accept it.
+		// stripping it still leaves a leading newline before the opening `---`.
 		const commented = path.join(pluginPath, "skills", "commented");
 		await fs.mkdir(commented, { recursive: true });
 		await fs.writeFile(
@@ -571,8 +574,8 @@ describe("agent-plugins discovery", () => {
 
 		const skills = await loadCapability<Skill>("skills", { cwd: tempDir });
 		const fromPlugin = skills.all.filter(skill => skill._source.provider === "agent-plugins");
-		expect(fromPlugin.map(skill => skill.name)).toEqual(["good"]);
-		expect(skills.warnings.some(warning => warning.includes(`"repairable": malformed YAML frontmatter`))).toBe(true);
+		expect(fromPlugin.map(skill => skill.name)).toEqual(["good", "repairable"]);
+		expect(skills.warnings.some(warning => warning.includes(`"broken": malformed YAML frontmatter`))).toBe(true);
 		expect(skills.warnings.some(warning => warning.includes(`"commented": missing required "name"`))).toBe(true);
 	});
 

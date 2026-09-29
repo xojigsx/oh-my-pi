@@ -68,6 +68,119 @@ function parseYamlRecord(metadata: string, repairTabs: boolean): Record<string, 
 	return loaded as Record<string, unknown>;
 }
 
+const TOP_LEVEL_PLAIN_KEY = /^([A-Za-z_][\w-]*):[ \t]*(.*)$/;
+
+/**
+ * Targeted repair for a failing record whose offending plain scalar spans
+ * multiple raw lines (F4: anthropics/claude-code pr-review-toolkit ships
+ * `agents/code-simplifier.md` whose `description` carries literal `\n`
+ * escapes plus raw continuation lines — `key: value` lookalikes such as
+ * `user: "..."` and bare prose lines — that no strict YAML parser accepts;
+ * Claude Code tolerates the shape).
+ *
+ * Detection: find the first line where the record stops parsing, then take the
+ * nearest preceding plain-scalar key carrying a literal `\n` (the tell of an
+ * authored multi-line scalar; the nearest preceding plain scalar otherwise) as
+ * the offending scalar. Rewrite it as a `|2-` literal block scalar absorbing
+ * the lines up to the next top-level key (or the end of the record),
+ * unescaping `\n` to real newlines. `|-` (literal, strip) is chosen so the
+ * text survives: line breaks stay line breaks and no other byte moves — the
+ * parsed value differs from the source scalar only in newline representation
+ * (literal `\\n` vs real newlines, real line breaks kept rather than folded).
+ *
+ * A rewrite is accepted only when the re-parse round-trips: the repaired
+ * value equals its source text modulo newline representation and every
+ * top-level key outside the absorbed region still resolves. Anything else
+ * returns `undefined` and the caller keeps the strict warn/throw fallback, so
+ * malformed YAML that cannot round-trip is never masked.
+ */
+function repairMultiLinePlainScalar(metadata: string): string | undefined {
+	// The strict attempt already widened tabs; keep the rewrite aligned with
+	// what the re-parse will see.
+	const lines = metadata.replaceAll("\t", "  ").split("\n");
+
+	// First line at which the record stops parsing as a mapping. A failure on
+	// (or before) the first line leaves no preceding scalar to repair.
+	let failAt = -1;
+	for (let i = 0; i < lines.length; i++) {
+		try {
+			if (parseYamlRecord(lines.slice(0, i + 1).join("\n"), true) !== null) continue;
+		} catch {
+			// The prefix failed to parse; record it below.
+		}
+		failAt = i;
+		break;
+	}
+	if (failAt <= 0) return undefined;
+
+	// Candidate owners: plain-scalar keys before the failure. Flow/quoted/
+	// explicit values are self-terminating and never the offending scalar.
+	const candidates: { index: number; key: string; value: string }[] = [];
+	for (let i = 0; i < failAt; i++) {
+		const entry = TOP_LEVEL_PLAIN_KEY.exec(lines[i]);
+		if (!entry) continue;
+		const value = entry[2];
+		if (value.length > 0 && FLOW_OR_EXPLICIT_VALUE_START.has(value[0])) continue;
+		candidates.push({ index: i, key: entry[1], value });
+	}
+	// An authored multi-line scalar carries literal `\n` escapes — prefer those
+	// (closest to the failure first), then the plain scalars closest to it.
+	candidates.sort((a, b) => {
+		const aEscaped = lines[a.index].includes("\\n");
+		const bEscaped = lines[b.index].includes("\\n");
+		if (aEscaped !== bEscaped) return aEscaped ? -1 : 1;
+		return b.index - a.index;
+	});
+
+	for (const { index: start, key, value } of candidates) {
+		// Only a top-level key line (or the end of the record) can terminate the
+		// block: any other remainder starts on a non-key line, which never
+		// parses as a mapping.
+		const splits: number[] = [];
+		for (let j = start + 1; j < lines.length; j++) {
+			if (TOP_LEVEL_PLAIN_KEY.test(lines[j])) splits.push(j);
+		}
+		splits.push(lines.length);
+
+		for (const split of splits) {
+			const region = lines.slice(start + 1, split);
+			// Only absorb a region holding actual non-key content — a block that
+			// merely swallows well-formed `key: value` lines is not the failing
+			// multi-line-scalar shape and would silently delete sibling keys.
+			if (!region.some(line => line.trim() !== "" && !TOP_LEVEL_PLAIN_KEY.test(line))) continue;
+
+			// Literal `\n` sequences become real newlines; every other byte of the
+			// source scalar survives verbatim.
+			const unescaped = [value, ...region].join("\n").replaceAll("\\n", "\n");
+			// `|-` chomps trailing line breaks; mirror that for the round-trip check.
+			const expected = unescaped.replace(/\n+$/u, "");
+			const block = [`${key}: |2-`, ...unescaped.split("\n").map(line => (line === "" ? "" : `  ${line}`))];
+			const rebuilt = [...lines.slice(0, start), ...block, ...lines.slice(split)].join("\n");
+
+			let repaired: Record<string, unknown> | null;
+			try {
+				repaired = parseYamlRecord(rebuilt, true);
+			} catch {
+				continue;
+			}
+			if (repaired === null || repaired[key] !== expected) continue;
+
+			// Round-trip: every top-level key outside the absorbed region resolves.
+			let intact = true;
+			for (let j = 0; j < lines.length; j++) {
+				if (j > start && j < split) continue;
+				const other = TOP_LEVEL_PLAIN_KEY.exec(lines[j]);
+				if (other && !(other[1] in repaired)) {
+					intact = false;
+					break;
+				}
+			}
+			if (intact) return rebuilt;
+		}
+	}
+	return undefined;
+}
+
 export class FrontmatterError extends Error {
 	constructor(
 		error: Error,
@@ -105,10 +218,13 @@ export interface FrontmatterOptions {
 	level?: "off" | "warn" | "fatal";
 	/**
 	 * Attempt lenient recovery of near-miss input before failing: quote
-	 * ambiguous plain scalars, replace tabs with spaces, and strip leading HTML
-	 * comments ahead of the opening delimiter. Default `true`. Spec-conformant
-	 * loaders set `false` so malformed input is rejected instead of silently
-	 * repaired (CRLF newline normalization still applies).
+	 * ambiguous plain scalars, replace tabs with spaces, strip leading HTML
+	 * comments ahead of the opening delimiter, and — when the record still
+	 * fails — rewrite the offending multi-line plain scalar as a block scalar
+	 * that round-trips its text (modulo newline representation). Default
+	 * `true`. Spec-conformant loaders set `false` so malformed input is
+	 * rejected instead of silently repaired (CRLF newline normalization still
+	 * applies).
 	 */
 	repair?: boolean;
 	/**
@@ -159,13 +275,27 @@ export function parseFrontmatter(
 		const loaded = parseYamlRecord(metadata, repair);
 		return { frontmatter: finalizeKeys({ ...frontmatter, ...loaded }), body };
 	} catch (error) {
-		const quotedMetadata = repair ? quoteAmbiguousPlainScalars(metadata) : undefined;
-		if (quotedMetadata) {
-			try {
-				const loaded = parseYamlRecord(quotedMetadata, true);
-				return { frontmatter: finalizeKeys({ ...frontmatter, ...loaded }), body };
-			} catch {
-				// Fall through to the existing warning + simple key/value fallback.
+		if (repair) {
+			const quotedMetadata = quoteAmbiguousPlainScalars(metadata);
+			if (quotedMetadata) {
+				try {
+					const loaded = parseYamlRecord(quotedMetadata, true);
+					return { frontmatter: finalizeKeys({ ...frontmatter, ...loaded }), body };
+				} catch {
+					// Fall through to the block-scalar repair below.
+				}
+			}
+
+			const blockMetadata = repairMultiLinePlainScalar(metadata);
+			if (blockMetadata !== undefined) {
+				try {
+					const loaded = parseYamlRecord(blockMetadata, true);
+					if (loaded !== null) {
+						return { frontmatter: finalizeKeys({ ...frontmatter, ...loaded }), body };
+					}
+				} catch {
+					// Fall through to the existing warning + simple key/value fallback.
+				}
 			}
 		}
 

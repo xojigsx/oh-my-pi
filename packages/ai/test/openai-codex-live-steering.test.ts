@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import { planSteeredRequest } from "@oh-my-pi/pi-ai/providers/openai-codex/live-steering";
+import type { CodexSteerAck } from "@oh-my-pi/pi-ai/providers/openai-codex/live-steering";
 import { streamOpenAICodexResponses } from "@oh-my-pi/pi-ai/providers/openai-codex-responses";
 import type {
 	AssistantMessage,
@@ -160,6 +161,27 @@ function options(providerSessionState: Map<string, ProviderSessionState>, liveSt
 const SYSTEM = ["You are a helpful assistant."];
 const creates = () => ScriptedWebSocket.sent.filter(frame => frame.type === "response.create");
 const steers = () => ScriptedWebSocket.sent.filter(frame => frame.type === "response.steer");
+
+/** The live codex websocket connection behind a test session. */
+type SteerableConnection = {
+	steer(previousResponseId: string, input: unknown[]): Promise<CodexSteerAck>;
+};
+
+function activeCodexConnection(providerSessionState: Map<string, ProviderSessionState>): SteerableConnection {
+	for (const rawState of providerSessionState.values()) {
+		// Session registry entry: the provider keeps its richer per-provider state behind this map.
+		const state = rawState as ProviderSessionState & Record<string, unknown>;
+		if (!(state.webSocketSessions instanceof Map)) continue;
+		for (const session of state.webSocketSessions.values()) {
+			if (!session || typeof session !== "object" || !("connection" in session)) continue;
+			const connection = session.connection;
+			if (!connection) continue;
+			// In-process value whose class stays internal to the provider module.
+			return connection as SteerableConnection;
+		}
+	}
+	throw new Error("expected an active codex websocket connection");
+}
 
 describe("codex live steering", () => {
 	it("steers the streaming response and reads the server's automatic continuation without sending a request", async () => {
@@ -330,6 +352,152 @@ describe("codex live steering", () => {
 		expect(creates()[1]?.input).toEqual([
 			{ role: "user", content: [{ type: "input_text", text: "one more thing" }] },
 		]);
+	});
+
+	it("defers a steer submitted while a response.create is opening until response.created", async () => {
+		let createSocket: ScriptedWebSocket | undefined;
+		let signalCreateSent!: () => void;
+		const createSent = new Promise<void>(resolve => {
+			signalCreateSent = resolve;
+		});
+		installSocket((frame, socket) => {
+			if (frame.type === "response.create") {
+				// Hold `response.created`: the native lane stays `opening`.
+				createSocket = socket;
+				signalCreateSent();
+				return;
+			}
+			if (frame.type === "response.steer") {
+				socket.emit({
+					type: "response.steer.accepted",
+					steer: { id: "steer_1", previous_response_id: frame.previous_response_id },
+				});
+				return;
+			}
+			throw new Error(`unexpected frame: ${JSON.stringify(frame)}`);
+		});
+		const model = createGpt6Model();
+		const state = new Map<string, ProviderSessionState>();
+		const user: UserMessage = { role: "user", content: "Draft a plan", timestamp: Date.now() };
+		const pending = streamOpenAICodexResponses(
+			model,
+			{ systemPrompt: SYSTEM, messages: [user] },
+			options(state),
+		).result();
+
+		await createSent;
+		expect(creates()).toHaveLength(1);
+
+		// The create owns the lane (`opening`): a steer submitted now must queue.
+		const steerPromise = activeCodexConnection(state).steer("resp_1", [
+			{ role: "user", content: [{ type: "input_text", text: "use tabs" }] },
+		]);
+		await Promise.resolve();
+		expect(steers()).toHaveLength(0);
+
+		// `response.created` opens the lane; the steer lands strictly after the create.
+		createSocket!.emit({ type: "response.created", response: { id: "resp_1" } });
+		expect(await steerPromise).toEqual({ accepted: true, id: "steer_1" });
+		expect(ScriptedWebSocket.sent.map(frame => frame.type)).toEqual(["response.create", "response.steer"]);
+
+		createSocket!.emit(
+			...messageFrames("msg_1", "Hello"),
+			{ type: "response.completed", response: { id: "resp_1", status: "completed", usage: USAGE } },
+		);
+		const result = await pending;
+		expect(result.stopReason).toBe("stop");
+		expect(result.content).toEqual([expect.objectContaining({ type: "text", text: "Hello" })]);
+	});
+
+	it("never interleaves two sends: a queued create and steer flush strictly in FIFO order", async () => {
+		let connectionSocket: ScriptedWebSocket | undefined;
+		let signalSecondCreate!: () => void;
+		const secondCreateSent = new Promise<void>(resolve => {
+			signalSecondCreate = resolve;
+		});
+		installSocket((frame, socket) => {
+			if (frame.type === "response.create" && creates().length === 1) {
+				connectionSocket = socket;
+				socket.emit(
+					{ type: "response.created", response: { id: "resp_1" } },
+					...messageFrames("msg_1", "First answer"),
+					{ type: "response.completed", response: { id: "resp_1", status: "completed", usage: USAGE } },
+				);
+				return;
+			}
+			if (frame.type === "response.create") {
+				// Turn 2's create is written only once the successor's terminal frees the lane.
+				signalSecondCreate();
+				return;
+			}
+			if (frame.type === "response.steer") {
+				socket.emit({
+					type: "response.steer.accepted",
+					steer: { id: "steer_1", previous_response_id: frame.previous_response_id },
+				});
+				return;
+			}
+			throw new Error(`unexpected frame: ${JSON.stringify(frame)}`);
+		});
+		const model = createGpt6Model();
+		const state = new Map<string, ProviderSessionState>();
+		const firstUser: UserMessage = { role: "user", content: "First question", timestamp: Date.now() };
+		const first = await streamOpenAICodexResponses(
+			model,
+			{ systemPrompt: SYSTEM, messages: [firstUser] },
+			options(state),
+		).result();
+		expect(first.stopReason).toBe("stop");
+
+		// A steered successor announces itself with no reader attached: the lane
+		// is `streaming`, so the next create must queue instead of writing.
+		connectionSocket!.emit({ type: "response.created", response: { id: "resp_2" } });
+		await Promise.resolve();
+
+		const secondUser: UserMessage = { role: "user", content: "Second question", timestamp: Date.now() + 1 };
+		const turn2 = streamOpenAICodexResponses(
+			model,
+			{ systemPrompt: SYSTEM, messages: [firstUser, first, secondUser] },
+			options(state),
+		);
+		const events = turn2[Symbol.asyncIterator]();
+		// `start` precedes the request generator's enqueue — the chained create is
+		// now FIFO-head, blocked by the streaming successor.
+		const startEvent = await events.next();
+		expect(startEvent.done).toBe(false);
+		expect(creates()).toHaveLength(1);
+
+		// The successor's terminal frees the lane: the create writes and opens it.
+		connectionSocket!.emit({
+			type: "response.completed",
+			response: { id: "resp_2", status: "completed", usage: USAGE },
+		});
+		await secondCreateSent;
+		expect(creates()).toHaveLength(2);
+
+		// The lane is `opening`: a steer must queue behind the create, not write.
+		const steerPromise = activeCodexConnection(state).steer("resp_1", [
+			{ role: "user", content: [{ type: "input_text", text: "use tabs" }] },
+		]);
+		await Promise.resolve();
+		expect(steers()).toHaveLength(0);
+
+		// `response.created` opens streaming: the queued steer flushes, strictly after the create.
+		connectionSocket!.emit({ type: "response.created", response: { id: "resp_3" } });
+		expect(await steerPromise).toEqual({ accepted: true, id: "steer_1" });
+		expect(ScriptedWebSocket.sent.map(frame => frame.type)).toEqual([
+			"response.create",
+			"response.create",
+			"response.steer",
+		]);
+
+		connectionSocket!.emit(
+			...messageFrames("msg_2", "Second answer"),
+			{ type: "response.completed", response: { id: "resp_3", status: "completed", usage: USAGE } },
+		);
+		const second = await turn2.result();
+		expect(second.stopReason).toBe("stop");
+		expect(JSON.stringify(second.content)).toContain("Second answer");
 	});
 });
 

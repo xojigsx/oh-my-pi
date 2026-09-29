@@ -5008,6 +5008,275 @@ describe("openai-codex streaming", () => {
 			lastPreviousResponseId: undefined,
 		});
 	});
+
+	it("replays an independent response.create after an unsupported native inflight rejection", async () => {
+		const tempDir = TempDir.createSync("@pi-codex-stream-");
+		setAgentDir(tempDir.path());
+		const token = createCodexTestToken();
+		const sentRequests: Array<Record<string, unknown>> = [];
+		const fetchMock = vi.fn(async () => {
+			throw new Error("SSE fallback should not be called");
+		});
+
+		class UnsupportedInflightWebSocket extends MockWebSocket {
+			constructor(url: string, options?: { headers?: WsHeaders }) {
+				super(url, options);
+				this.scheduleOpen();
+			}
+
+			override send(data: string): void {
+				const request = JSON.parse(data) as Record<string, unknown>;
+				sentRequests.push(request);
+				const requestIndex = sentRequests.length;
+
+				if (requestIndex === 1) {
+					this.emitCodexResponse({
+						messageId: "msg_1",
+						responseId: "resp_1",
+						text: "First answer",
+						terminalType: "response.completed",
+						includeCreated: true,
+					});
+					return;
+				}
+
+				if (requestIndex === 2) {
+					// Two delivery paths hit the native lane inside one turn window:
+					// the server rejects the frame with the incident's code, then
+					// closes the websocket with 1000.
+					expect(request.previous_response_id).toBe("resp_1");
+					this.sendJson({
+						type: "error",
+						code: "unsupported_native_inflight_message",
+						message: "unsupported native inflight message",
+					});
+					this.readyState = MockWebSocket.CLOSED;
+					this.emit("close", { code: 1000 } as unknown as Event);
+					return;
+				}
+
+				if (requestIndex === 3) {
+					// Independent replay: the previous_response_id chain was dropped.
+					expect(request.previous_response_id).toBeUndefined();
+					this.emitCodexResponse({
+						messageId: "msg_3",
+						responseId: "resp_3",
+						text: "Second answer",
+						terminalType: "response.completed",
+						includeCreated: true,
+					});
+					return;
+				}
+
+				throw new Error(`Unexpected websocket request index: ${requestIndex}`);
+			}
+		}
+
+		global.WebSocket = UnsupportedInflightWebSocket as unknown as typeof WebSocket;
+		const model = createCodexTestModel("https://chatgpt.com/backend-api");
+		const providerSessionState = new Map<string, ProviderSessionState>();
+		const firstContext: Context = {
+			systemPrompt: ["You are a helpful assistant."],
+			messages: [{ role: "user", content: "First question", timestamp: Date.now() }],
+		};
+		const firstResponse = await streamOpenAICodexResponses(model, firstContext, {
+			fetch: fetchMock as FetchImpl,
+			apiKey: token,
+			sessionId: "ws-unsupported-inflight-session",
+			providerSessionState,
+		}).result();
+		const secondContext: Context = {
+			systemPrompt: ["You are a helpful assistant."],
+			messages: [
+				...firstContext.messages,
+				firstResponse,
+				{ role: "user", content: "Second question", timestamp: Date.now() + 1 },
+			],
+		};
+
+		const secondResponse = await streamOpenAICodexResponses(model, secondContext, {
+			fetch: fetchMock as FetchImpl,
+			apiKey: token,
+			sessionId: "ws-unsupported-inflight-session",
+			providerSessionState,
+		}).result();
+
+		// No terminal provider error surfaces: the rejection recovers into a
+		// fresh, independent response.create turn.
+		expect(secondResponse.stopReason).toBe("stop");
+		expect(secondResponse.errorMessage).toBeUndefined();
+		expect(JSON.stringify(secondResponse.content)).toContain("Second answer");
+		expect(fetchMock).not.toHaveBeenCalled();
+		expect(sentRequests).toHaveLength(3);
+		expect(sentRequests[1]?.previous_response_id).toBe("resp_1");
+		expect(sentRequests[2]?.previous_response_id).toBeUndefined();
+		const replayInput = sentRequests[2]?.input;
+		expect(Array.isArray(replayInput)).toBe(true);
+		expect(JSON.stringify(replayInput)).toContain("First question");
+		expect(JSON.stringify(replayInput)).toContain("Second question");
+		const stats = getOpenAICodexWebSocketDebugStats(model, {
+			sessionId: "ws-unsupported-inflight-session",
+			providerSessionState,
+		});
+		expect(stats).toMatchObject({
+			fullContextRequests: 2,
+			deltaRequests: 1,
+			lastPreviousResponseId: undefined,
+		});
+	});
+
+	it("surfaces the unsupported native inflight rejection once content was delivered", async () => {
+		const tempDir = TempDir.createSync("@pi-codex-stream-");
+		setAgentDir(tempDir.path());
+		const token = createCodexTestToken();
+		const sentRequests: Array<Record<string, unknown>> = [];
+		const fetchMock = vi.fn(async () => {
+			throw new Error("SSE fallback should not be called");
+		});
+
+		class UnsupportedInflightDeliveredWebSocket extends MockWebSocket {
+			constructor(url: string, options?: { headers?: WsHeaders }) {
+				super(url, options);
+				this.scheduleOpen();
+			}
+
+			override send(data: string): void {
+				const request = JSON.parse(data) as Record<string, unknown>;
+				sentRequests.push(request);
+				const requestIndex = sentRequests.length;
+
+				if (requestIndex === 1) {
+					this.emitCodexResponse({
+						messageId: "msg_1",
+						responseId: "resp_1",
+						text: "First answer",
+						terminalType: "response.completed",
+						includeCreated: true,
+					});
+					return;
+				}
+
+				if (requestIndex === 2) {
+					// The rejection arrives only after content was delivered, so the
+					// bounded behavior applies: no replay, the error surfaces.
+					expect(request.previous_response_id).toBe("resp_1");
+					this.sendJson({ type: "response.created", response: { id: "resp_2" } });
+					this.sendJson({
+						type: "response.output_item.added",
+						item: { type: "message", id: "msg_partial", role: "assistant", status: "in_progress", content: [] },
+					});
+					this.sendJson({ type: "response.content_part.added", part: { type: "output_text", text: "" } });
+					this.sendJson({ type: "response.output_text.delta", delta: "Partial answer" });
+					this.sendJson({
+						type: "error",
+						code: "unsupported_native_inflight_message",
+						message: "unsupported native inflight message",
+					});
+					this.readyState = MockWebSocket.CLOSED;
+					this.emit("close", { code: 1000 } as unknown as Event);
+					return;
+				}
+
+				throw new Error(`Unexpected websocket request index: ${requestIndex}`);
+			}
+		}
+
+		global.WebSocket = UnsupportedInflightDeliveredWebSocket as unknown as typeof WebSocket;
+		const model = createCodexTestModel("https://chatgpt.com/backend-api");
+		const providerSessionState = new Map<string, ProviderSessionState>();
+		const firstContext: Context = {
+			systemPrompt: ["You are a helpful assistant."],
+			messages: [{ role: "user", content: "First question", timestamp: Date.now() }],
+		};
+		const firstResponse = await streamOpenAICodexResponses(model, firstContext, {
+			fetch: fetchMock as FetchImpl,
+			apiKey: token,
+			sessionId: "ws-unsupported-inflight-delivered-session",
+			providerSessionState,
+		}).result();
+		const secondContext: Context = {
+			systemPrompt: ["You are a helpful assistant."],
+			messages: [
+				...firstContext.messages,
+				firstResponse,
+				{ role: "user", content: "Second question", timestamp: Date.now() + 1 },
+			],
+		};
+
+		const secondResponse = await streamOpenAICodexResponses(model, secondContext, {
+			fetch: fetchMock as FetchImpl,
+			apiKey: token,
+			sessionId: "ws-unsupported-inflight-delivered-session",
+			providerSessionState,
+		}).result();
+
+		expect(secondResponse.stopReason).toBe("error");
+		expect(secondResponse.errorMessage).toContain("unsupported_native_inflight_message");
+		expect(JSON.stringify(secondResponse.content)).toContain("Partial answer");
+		expect(fetchMock).not.toHaveBeenCalled();
+		expect(sentRequests).toHaveLength(2);
+	});
+
+	it("reopens and replays over websockets when the server closes with 1000 before any terminal event", async () => {
+		const tempDir = TempDir.createSync("@pi-codex-stream-");
+		setAgentDir(tempDir.path());
+		const token = createCodexTestToken();
+		const sentRequests: Array<Record<string, unknown>> = [];
+		const fetchMock = vi.fn(async () => {
+			throw new Error("SSE fallback should not be called");
+		});
+
+		let constructorCount = 0;
+		class CloseBeforeTerminalWebSocket extends MockWebSocket {
+			constructor(url: string, options?: { headers?: WsHeaders }) {
+				super(url, options);
+				constructorCount += 1;
+				this.scheduleOpen();
+			}
+
+			override send(data: string): void {
+				const request = JSON.parse(data) as Record<string, unknown>;
+				sentRequests.push(request);
+				if (sentRequests.length === 1) {
+					// Close-only race: the socket dies with 1000 while the create is
+					// opening — no terminal frame was processed, nothing delivered.
+					this.readyState = MockWebSocket.CLOSED;
+					this.emit("close", { code: 1000 } as unknown as Event);
+					return;
+				}
+				this.emitCodexResponse({
+					messageId: "msg_recovered",
+					responseId: "resp_recovered",
+					text: "Recovered answer",
+					terminalType: "response.completed",
+					includeCreated: true,
+				});
+			}
+		}
+
+		global.WebSocket = CloseBeforeTerminalWebSocket as unknown as typeof WebSocket;
+		const model = createCodexTestModel("https://chatgpt.com/backend-api");
+		const providerSessionState = new Map<string, ProviderSessionState>();
+		const context: Context = {
+			systemPrompt: ["You are a helpful assistant."],
+			messages: [{ role: "user", content: "Hello", timestamp: Date.now() }],
+		};
+		const result = await streamOpenAICodexResponses(model, context, {
+			fetch: fetchMock as FetchImpl,
+			apiKey: token,
+			sessionId: "ws-close-1000-session",
+			providerSessionState,
+		}).result();
+
+		// The close-1000 lands in the reopen/replay machinery instead of surfacing
+		// a terminal provider error with an empty assistant entry.
+		expect(result.stopReason).toBe("stop");
+		expect(result.errorMessage).toBeUndefined();
+		expect(result.content).toEqual([expect.objectContaining({ type: "text", text: "Recovered answer" })]);
+		expect(constructorCount).toBe(2);
+		expect(sentRequests).toHaveLength(2);
+		expect(fetchMock).not.toHaveBeenCalled();
+	});
 	it.each([
 		["a pre-response rate_limit_exceeded rejection", "rate_limit_exceeded", false],
 		["slow_down interrupts response progress", "slow_down", true],

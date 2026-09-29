@@ -285,6 +285,18 @@ const CODEX_WS_RESPONSES_LITE_CLIENT_METADATA_KEY = "ws_request_header_x_openai_
 const CODEX_MODERATION_METADATA_KEY = "openai_chatgpt_moderation_metadata";
 /** Connection-level websocket failures that should immediately fall back to SSE without retrying. */
 const CODEX_WEBSOCKET_FATAL_PATTERNS = ["websocket error:", "websocket closed before open", "connection timeout"];
+/**
+ * Frames that end the current native turn on the wire. Observing one returns the
+ * connection's native-lane state to `idle` (see `CodexWebSocketConnection`'s send
+ * queue): the lane accepts a new `response.create` again.
+ */
+const CODEX_NATIVE_LANE_TERMINAL_FRAMES: Record<string, true> = {
+	"response.completed": true,
+	"response.done": true,
+	"response.incomplete": true,
+	"response.failed": true,
+	error: true,
+};
 /** Max total time to spend retrying 429s with server-provided delays (5 minutes). */
 const CODEX_RATE_LIMIT_BUDGET_MS = 5 * 60 * 1000;
 const CODEX_ADDITIONAL_PROGRESS_EVENT_TYPES = new Set(["response.done", "response.incomplete"]);
@@ -2733,6 +2745,9 @@ class CodexStreamProcessor {
 			await this.#reopenWebSocketStream(this.runtime.websocketState);
 			return true;
 		}
+		if (await this.#tryRecoverUnsupportedNativeInflight(error)) {
+			return true;
+		}
 		if (await this.#tryDropRejectedAccessPrograms(error)) {
 			return true;
 		}
@@ -2752,6 +2767,50 @@ class CodexStreamProcessor {
 			return true;
 		}
 		return false;
+	}
+
+	/**
+	 * The server rejected a frame with `unsupported_native_inflight_message` and
+	 * closed the socket (1000): two delivery paths — a stateful continuation
+	 * `response.create` and queued-message steering — hit the native lane inside
+	 * one turn window without mutual exclusion (omp 18.3.2 incident). The
+	 * server's recovery instruction is to start a new independent
+	 * `response.create` turn: drop the `previous_response_id` chain, clear the
+	 * models etag and all accumulators, and replay the full context on a fresh
+	 * websocket. Only matches while nothing has been delivered yet — once
+	 * `output.content` holds blocks the error surfaces so the caller's
+	 * queued-message drain can reschedule the input. Bounded by
+	 * {@link CODEX_MAX_RETRIES}.
+	 */
+	async #tryRecoverUnsupportedNativeInflight(error: unknown): Promise<boolean> {
+		const websocketState = this.requestContext.websocketState;
+		if (
+			!(error instanceof CodexProviderStreamError) ||
+			error.code?.toLowerCase() !== "unsupported_native_inflight_message" ||
+			this.runtime.transport !== "websocket" ||
+			!websocketState ||
+			this.options?.signal?.aborted ||
+			this.runtime.providerRetryAttempt >= CODEX_MAX_RETRIES ||
+			this.output.content.length > 0
+		) {
+			return false;
+		}
+
+		this.runtime.providerRetryAttempt += 1;
+		resetCodexWebSocketAppendState(websocketState);
+		websocketState.modelsEtag = undefined;
+		this.runtime.resetAccumulators();
+		this.runtime.sawTerminalEvent = false;
+		resetOutputState(this.output);
+		this.firstTokenTime = undefined;
+
+		CODEX_DEBUG &&
+			logger.debug("[codex] unsupported native inflight message; starting a new independent response.create turn", {
+				retry: this.runtime.providerRetryAttempt,
+				retryBudget: CODEX_MAX_RETRIES,
+			});
+		await this.#reopenWebSocketStream(websocketState);
+		return true;
 	}
 
 	/**
@@ -3819,6 +3878,19 @@ interface CodexSteerWaiter {
 	reject: (error: Error) => void;
 }
 
+/**
+ * One write waiting for the connection's native lane. Which gate admits it
+ * depends on {@link CodexNativeLaneSend.kind}: a create needs the lane `idle`,
+ * a steer needs "not opening" — both run strictly FIFO.
+ */
+interface CodexNativeLaneSend {
+	kind: "create" | "steer";
+	/** Write the frame to the wire; throwing marks this queued send as failed. */
+	send: () => void;
+	/** Settle the submitter when `send` throws or the connection died while queued. */
+	fail: (error: Error) => void;
+}
+
 interface CodexWebSocketConnectionOptions {
 	onHandshakeHeaders?: (headers: Headers) => void;
 	proxy?: string;
@@ -3862,6 +3934,20 @@ class CodexWebSocketConnection {
 	#failedSteers = new Set<string>();
 	/** Steering whose automatic successor the active attach request is reading. */
 	#attachSteerIds?: ReadonlySet<string>;
+	/**
+	 * Native-lane turn state: what the server currently considers in flight on
+	 * this socket. `response.create` sends only from `idle` and flips to
+	 * `opening`; a `response.created` frame flips to `streaming`; terminal
+	 * frames and request-generator teardown flip back to `idle`. Sends are
+	 * serialized through {@link #nativeLaneQueue} so a queued-message steer
+	 * can never overtake an opening create (the server rejects that with
+	 * `unsupported_native_inflight_message` and closes the socket).
+	 */
+	#nativeLaneState: "idle" | "opening" | "streaming" = "idle";
+	/** Native-lane writes waiting for {@link #nativeLaneState} to admit them, oldest first. */
+	#nativeLaneQueue: CodexNativeLaneSend[] = [];
+	/** Re-entrancy guard: a synchronous mock answer can re-enter the drain from `onmessage`. */
+	#drainingNativeLane = false;
 
 	constructor(url: string, headers: Record<string, string>, options: CodexWebSocketConnectionOptions) {
 		this.#url = url;
@@ -3911,11 +3997,63 @@ class CodexWebSocketConnection {
 		return this.#headers.authorization === headers.authorization;
 	}
 
+	/**
+	 * Queue one native-lane write ({`response.create`} or {`response.steer`}).
+	 * The queue is strict FIFO: only the head runs, and only when its gate admits
+	 * the current {@link #nativeLaneState} — so two delivery paths can never
+	 * interleave unserialized inside one native-turn window.
+	 */
+	#enqueueNativeLaneSend(entry: CodexNativeLaneSend): void {
+		this.#nativeLaneQueue.push(entry);
+		this.#drainNativeLane();
+	}
+
+	#drainNativeLane(): void {
+		// Re-entrancy guard: a synchronous mock answer observed during `send`
+		// re-enters here from `onmessage`; the outer loop re-checks the head.
+		if (this.#drainingNativeLane) return;
+		this.#drainingNativeLane = true;
+		try {
+			while (this.#nativeLaneQueue.length > 0) {
+				const head = this.#nativeLaneQueue[0]!;
+				const admitted = head.kind === "create" ? this.#nativeLaneState === "idle" : this.#nativeLaneState !== "opening";
+				if (!admitted) return;
+				this.#nativeLaneQueue.shift();
+				try {
+					head.send();
+				} catch (error) {
+					head.fail(error instanceof Error ? error : new Error(String(error)));
+				}
+			}
+		} finally {
+			this.#drainingNativeLane = false;
+		}
+	}
+
+	/** Fail every send still waiting on the lane: the socket died before they could go out. */
+	#failNativeLaneQueue(error: Error): void {
+		const pending = this.#nativeLaneQueue.splice(0);
+		for (const send of pending) send.fail(error);
+	}
+
+	/** Observe a native-lane frame: `response.created` opens the turn, terminal frames end it. */
+	#observeNativeLaneFrame(type: unknown): void {
+		if (type === "response.created") {
+			this.#nativeLaneState = "streaming";
+		} else if (typeof type === "string" && Object.hasOwn(CODEX_NATIVE_LANE_TERMINAL_FRAMES, type)) {
+			this.#nativeLaneState = "idle";
+		} else {
+			return;
+		}
+		this.#drainNativeLane();
+	}
+
 	close(reason = "done"): void {
 		const socket = this.#socket;
 		this.#socket = null;
 		this.#stopHeartbeat();
 		this.#rejectSteerWaiters(`websocket closed (${reason})`);
+		this.#failNativeLaneQueue(new CodexWebSocketTransportError(`websocket closed (${reason})`));
 		if (!socket || (socket.readyState !== WebSocket.OPEN && socket.readyState !== WebSocket.CONNECTING)) return;
 		try {
 			socket.close(1000, reason);
@@ -4007,6 +4145,7 @@ class CodexWebSocketConnection {
 			this.#socket = null;
 			this.#stopHeartbeat();
 			this.#rejectSteerWaiters(`websocket closed (${event.code})`);
+			this.#failNativeLaneQueue(new CodexWebSocketTransportError(`websocket closed (${event.code})`));
 			if (!settled) {
 				settled = true;
 				clearPending();
@@ -4043,6 +4182,12 @@ class CodexWebSocketConnection {
 					return;
 				}
 				this.#push(parsed);
+				// Native-lane observation runs after the frame is queued: draining the
+				// queue may synchronously write a queued create, and that create drops
+				// whatever it finds as stale — the frame that freed the lane must
+				// already be in the queue so it is dropped, not consumed as the new
+				// request's first frame.
+				this.#observeNativeLaneFrame(parsed.type);
 			} catch (error) {
 				notifyCodexWebSocketMalformed(this.#streamObserver, event.data, error);
 				this.#push(new CodexWebSocketTransportError(`${String(error)}`));
@@ -4115,10 +4260,10 @@ class CodexWebSocketConnection {
 					: undefined;
 
 				const requestPayload = JSON.stringify(request);
-				notifyCodexWebSocketOutbound(onSseEvent, request, requestPayload);
-				// Re-check liveness: the debug-session await above can outlive the socket.
-				// Preserve the abort cause: onAbort already queued a caused error, but this
-				// throw would otherwise mask it before #nextMessage() drains the queue.
+				// Re-check liveness: the debug-session await above (and any wait on the
+				// native lane) can outlive the socket. Preserve the abort cause: onAbort
+				// already queued a caused error, but this throw would otherwise mask it
+				// before #nextMessage() drains the queue.
 				const socket = this.#socket;
 				if (!socket || socket.readyState !== WebSocket.OPEN) {
 					if (signal?.aborted) {
@@ -4128,12 +4273,43 @@ class CodexWebSocketConnection {
 					}
 					throw new CodexWebSocketTransportError(`websocket connection is unavailable`);
 				}
+				// Serialize on the native lane: a create is only written while the lane
+				// is `idle` — it flips to `opening` and holds the lane until the server
+				// answers (`response.created` → `streaming`) or the turn ends, so a
+				// queued-message steer can never overtake it.
+				const { promise, resolve, reject } = Promise.withResolvers<void>();
+				this.#enqueueNativeLaneSend({
+					kind: "create",
+					send: () => {
+						const live = this.#socket;
+						if (!live || live.readyState !== WebSocket.OPEN) {
+							throw new CodexWebSocketTransportError(`websocket connection is unavailable`);
+						}
+						notifyCodexWebSocketOutbound(onSseEvent, request, requestPayload);
+						// Frames that arrived while this create waited on the lane belong
+						// to the response the lane was serving; drop them just before writing.
+						this.#dropStaleFrames();
+						this.#nativeLaneState = "opening";
+						try {
+							live.send(requestPayload);
+						} catch (error) {
+							throw new CodexWebSocketTransportError(
+								`websocket send failed: ${error instanceof Error ? error.message : String(error)}`,
+							);
+						}
+						resolve();
+					},
+					fail: reject,
+				});
 				try {
-					socket.send(requestPayload);
+					await promise;
 				} catch (error) {
-					throw new CodexWebSocketTransportError(
-						`websocket send failed: ${error instanceof Error ? error.message : String(error)}`,
-					);
+					if (signal?.aborted) {
+						throw new CodexWebSocketTransportError(`websocket connection is unavailable`, {
+							cause: signal.reason,
+						});
+					}
+					throw error;
 				}
 			} else if (this.hasFailedSteer(exchange.attachSteerIds)) {
 				throw new CodexSteerCommitError("accepted steering was not committed to a successor response");
@@ -4256,6 +4432,12 @@ class CodexWebSocketConnection {
 			this.#activeRequest = false;
 			this.#streamObserver = undefined;
 			this.#attachSteerIds = undefined;
+			// Request-generator teardown flips the native lane back to `idle` even
+			// when no terminal frame was observed (error/abort paths): no reader
+			// owns the lane anymore, so queued sends must not wait on frames that
+			// will never be consumed.
+			this.#nativeLaneState = "idle";
+			this.#drainNativeLane();
 			if (signal) {
 				signal.removeEventListener("abort", onAbort);
 			}
@@ -4279,17 +4461,32 @@ class CodexWebSocketConnection {
 		const { promise, resolve, reject } = Promise.withResolvers<CodexSteerAck>();
 		const waiter: CodexSteerWaiter = { previousResponseId, resolve, reject };
 		this.#steerWaiters.push(waiter);
-		notifyCodexWebSocketOutbound(this.#streamObserver, event, payload);
-		try {
-			socket.send(payload);
-		} catch (error) {
-			this.#steerWaiters.splice(this.#steerWaiters.indexOf(waiter), 1);
-			reject(
-				new CodexWebSocketTransportError(
-					`websocket send failed: ${error instanceof Error ? error.message : String(error)}`,
-				),
-			);
-		}
+		// A steer rides the same native-lane queue as the create: while a create
+		// is `opening` the server rejects any other frame
+		// (`unsupported_native_inflight_message`), so the steer waits for
+		// `response.created` (→ streaming) or a terminal frame/teardown (→ idle).
+		this.#enqueueNativeLaneSend({
+			kind: "steer",
+			send: () => {
+				const live = this.#socket;
+				if (!live || live.readyState !== WebSocket.OPEN) {
+					throw new CodexWebSocketTransportError(`websocket connection is unavailable`);
+				}
+				notifyCodexWebSocketOutbound(this.#streamObserver, event, payload);
+				try {
+					live.send(payload);
+				} catch (error) {
+					throw new CodexWebSocketTransportError(
+						`websocket send failed: ${error instanceof Error ? error.message : String(error)}`,
+					);
+				}
+			},
+			fail: error => {
+				const index = this.#steerWaiters.indexOf(waiter);
+				if (index >= 0) this.#steerWaiters.splice(index, 1);
+				reject(error);
+			},
+		});
 		return promise;
 	}
 
